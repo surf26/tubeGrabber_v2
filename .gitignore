@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+calib/data/
+outputs/
+*.png
+*.jpg
