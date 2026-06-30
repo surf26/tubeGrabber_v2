@@ -45,26 +45,87 @@ python verify.py                  # 挪动手臂看 target-in-base 是否稳定
 ```
 
 ### 2. 真机运行（务必逐级放开）
-```
-python run.py --mode detect                              # 看网格地图对不对
-python run.py --mode plan  --src left.A1 --dst right.C3  # 看位姿+安全检查+抓取几何检查
-python run.py --mode move  --src left.A1 --dst right.C3  # 移到源上方+精对准，不抓
-python run.py --mode grasp --src left.A1 --dst right.C3  # 才真的抓-搬-放
-```
-`--src/--dst` 是孔位编号 `board.row.col`（left.A1 / right.C3）。加 `--show` / `--save` 看/存标注图。
 
-## 已填 / 待填参数（见 config.py）
-已填(实测)：`TOOL_Z_OFFSET=0.22`、抓取几何(盖直径22 / 缝隙10 / 指厚8 / 露出22 / 夹深10mm)、
-模型 `models/tube_empty_yolo.pt`(来自 github.com/surf26/detector，类别 **0=empty,1=tube**)。
+四档 `detect → plan → move → grasp` 从“只看”到“真抓”逐级放开。**第一次务必一档一档来，别跳。**
+`--src/--dst` 是孔位编号 `board.row.col`（如 left.A1 / right.C3）。加 `--show`/`--save` 看/存标注图。
 
-仍待你上真机填的 ★：
-- `GRASP_ORIENTATION_RXRYRZ`：示教器读的竖直向下姿态
-- `GLOBAL_VIEW_POSE`：能拍全盘的高位姿态
-- `GRIPPER_MAX_OPEN_M`：夹爪最大张开宽度（查 EG2-4C2 规格书，要 > 盖直径 22mm）
-- `PLACE_Z_OFFSET_M`：放置下放深度（move 档观察后实测）
-- `BOARD_SPLIT_X`：左右分界像素（两板不对称时）
-- `WORKSPACE_*`：jog 四角实测的安全边界
-- 重新跑 `calib/` 得到 `eye_in_hand_handeye.json`
+---
+
+#### 准备（每次开跑前）
+1. 在**接了臂+相机**的那台机器（已装 `Robotic_Arm` / `pyorbbecsdk` / `ultralytics`，`conda activate surf`）。
+2. 机械臂上电、连网，`ping 192.168.1.18` 通；急停按钮放手边。
+3. 相机 USB3.0 插好：`python calib/list_cameras.py` 能看到 `CP84B4100090`。
+4. `config.ROBOT_SPEED` 保持小（默认 10）。
+
+#### 第 1 档 `detect`——只看，不动手（除移到全局视野）
+```
+python run.py --mode detect
+```
+预期输出（节选）：
+```
+已加载手眼标定：T_cam2gripper ...
+模型类别 names = {0: 'empty', 1: 'tube'}   ← 核对是不是 0=empty,1=tube
+  -> 移到全局视野位姿 [x=8.9 y=208.3 z=350.6 mm | ...]
+检测+结算到 N 个孔位（共 N 个目标）：
+left              right
+      c1 c2 c3     c1 c2 c3
+A     .  T  T     A   .  T  T
+...
+```
+**必须核对 3 件事**，有一个不对就先停下调，别往下走：
+- ① `model.names` 是 `{0: empty, 1: tube}`；不是就改 config 的 `EMPTY_CLS/TUBE_CLS`。
+- ② ASCII 网格的 `left/right`、`A–D` 行、`1–3` 列方向和**实物一致**；不一致改 `BOARD_SPLIT_X / LEFT_ROWS / RIGHT_ROWS`。
+- ③ 每孔的 base 坐标 `(x,y,z)` 落在机械臂正常工作区内、量级合理（mm）。
+  - 加 `--show` 可弹窗看检测框+编号+坐标叠加图核对。
+
+#### 第 2 档 `plan`——看位姿 + 安全 + 抓取几何，仍不动手
+```
+python run.py --mode plan --src left.A1 --dst right.C3
+```
+会打印：源/目标的预抓取位姿、抓取几何检查（夹爪张开 vs 盖直径、缝隙余量）、安全检查结果。
+- 安全检查 ❌ 越界：说明 `WORKSPACE_*` 太紧或目标确实不可达 → 按 detect 看到的真实坐标把 `WORKSPACE_*` 收到合理范围再试。
+
+#### 第 3 档 `move`——粗定位 + 精对准，停在源上方（**第一次真动臂！**）
+```
+python run.py --mode move --src left.A1 --dst right.C3
+```
+机械臂会移到源试管上方，然后 look-and-move 反复“拍一张→挪一点”，打印每次 `Δ` 直到收敛：
+```
+[align] 第1次：Δ=6.20mm base=[...]
+[align] 第2次：Δ=0.80mm base=[...]
+[align] 已收敛(<2.0mm)
+```
+**手放急停旁**。看它有没有稳稳停在试管正上方、Δ 是否在收敛。不收敛通常是深度噪声/检测抖动 → 调 `DEPTH_*` 或 `YOLO_CONF`。
+
+#### 第 4 档 `grasp`——真抓真放
+```
+python run.py --mode grasp --src left.A1 --dst right.C3
+```
+完整序列：精对准 → 供电24V → 开爪 → 下扎 → 闭合 → 抬起 → 搬到空槽上方 → 精对准 → 下放 → 开爪 → 抬起 → 回全局视野。
+- **抓取间距很紧（见文末）**：先拿边角试管验证，确认指尖对准缝隙中心。
+- 放置太浅/太深：调 `PLACE_Z_OFFSET_M`（负=多往下放）。
+
+#### 常见问题
+| 现象 | 可能原因 / 处理 |
+|------|------|
+| `detect` 检测不到试管 | 相机没看到 / `YOLO_CONF` 太高 / 深度全空洞（看 `DEPTH_VALID_*` 范围） |
+| 网格行列方向反 | 改 `BOARD_SPLIT_X / LEFT_ROWS / RIGHT_ROWS` |
+| 坐标整体偏移 | 手眼标定不准 → 重跑 `calib/`；或确认 `GLOBAL_VIEW_POSE` 单位/数值 |
+| `plan` 安全检查总不过 | `WORKSPACE_*` 没按真实坐标设 |
+| `align` 的 Δ 不收敛 | 深度噪声/检测抖动 → 调 `DEPTH_PATCH / DEPTH_VALID_* / YOLO_CONF` |
+| 夹爪不动 | 没供电：确认 `enable_gripper_power()`（末端 24V）生效 |
+
+## 参数状态（见 config.py）
+**已填**：
+- 手眼标定 `calib/results/eye_in_hand_handeye.json`（T_cam2gripper，20 样本）
+- `GLOBAL_VIEW_POSE` / `GRASP_ORIENTATION_RXRYRZ`（示教器实测，竖直向下）
+- `TOOL_Z_OFFSET=0.22`、抓取几何(盖直径22 / 缝隙10 / 指厚8 / 露出22 / 夹深10mm)、`GRIPPER_MAX_OPEN_M=0.032`
+- 模型 `models/tube_empty_yolo.pt`(来自 github.com/surf26/detector，类别 **0=empty,1=tube**)
+
+**仍建议上真机后按实测收紧/确认**：
+- `WORKSPACE_*`：现在是围绕全局位姿的临时框，跑 `detect` 看真实坐标后收紧 + jog 四角确认
+- `PLACE_Z_OFFSET_M`：放置下放深度（`move` 档观察空槽实际深度后调）
+- `BOARD_SPLIT_X`：左右分界像素（两板不对称时才需填）
 
 ## 孔位编号约定（board.row.col，沿用 detector 仓库）
 左右两块板 × 4 行(A–D) × 3 列(1–3)。`detect` 会打印 ASCII 图，对照实物；
