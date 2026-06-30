@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import interfaces
 from align import LookAndMoveAligner
-from core import grasp_check
+from core import geometry, grasp_check
 from core.grasp_planner import GraspPlanner, WorkspaceError
 from core.rack_model import RackMap, build_rack
 from core.solver import PoseSolver
@@ -49,15 +49,58 @@ class TubeGrabberPipeline:
         self.robot.move_to_pose(self.global_view_pose, speed=self.speed, block=True)
 
     # ---------- 感知：拍 -> 双类检测 -> 结算 -> 建网格 ----------
-    def perceive_global(self) -> tuple[RackMap, list[GraspTarget]]:
+    def perceive_global(self, debug: bool = True) -> tuple[RackMap, list[GraspTarget]]:
         color, depth = self.camera.get_frames()
         self.last_color = color
         flange2base = self.robot.get_flange2base()       # eye_in_hand 必须实时读
         detections = self.detector.detect(color)
+
+        if debug:
+            self._depth_diagnostics(color, depth, detections)
+
         targets = self.solver.solve(detections, depth, flange2base)
+
+        if debug and len(targets) < len(detections):
+            print(f"\n⚠ YOLO 检测到 {len(detections)} 个，但只有 {len(targets)} 个采到有效深度、能算坐标。"
+                  f"\n  多半是【黑色试管盖吸红外→深度空洞】或【深度未对齐/超范围】。"
+                  f"\n  上面逐框深度看哪些是 '空洞/超范围'；对策见 README 排查表（加大 DEPTH_PATCH / 调 DEPTH_VALID_* / 确认 D2C 对齐）。")
+
         rack = build_rack(targets, tube_cls=self.tube_cls,
                           image_width=color.shape[1], **self.rack_params)
         return rack, targets
+
+    # ---------- 深度诊断：为什么检测到却算不出坐标 ----------
+    def _depth_diagnostics(self, color, depth, detections) -> None:
+        import numpy as np
+        scale = self.solver.depth_scale
+        zmin, zmax, patch = self.solver.depth_min, self.solver.depth_max, self.solver.depth_patch
+        n_tube = sum(d.cls == self.tube_cls for d in detections)
+        print(f"\n[感知诊断] YOLO 原始检测 {len(detections)} 个"
+              f"（tube={n_tube} empty={len(detections)-n_tube}）")
+        same = (depth.shape[:2] == color.shape[:2])
+        print(f"[感知诊断] color={color.shape[:2]} depth={depth.shape[:2]} "
+              f"{'同尺寸✓(已对齐)' if same else '⚠尺寸不一致！深度没对齐到彩色，采样会全错'}  "
+              f"depth_scale={scale}")
+        dm = depth.astype(float) * scale
+        valid = (dm > zmin) & (dm < zmax)
+        ratio = 100.0 * valid.mean() if dm.size else 0.0
+        med = float(np.median(dm[valid])) if valid.any() else float('nan')
+        print(f"[感知诊断] 深度图有效像素 {ratio:.1f}%  有效中位深度 {med:.3f}m  "
+              f"（有效范围设定 {zmin}~{zmax}m）")
+        print(f"[感知诊断] 逐框深度采样(patch={patch})：")
+        H, W = depth.shape[:2]
+        for i, d in enumerate(detections):
+            u, v = int(round(d.pixel[0])), int(round(d.pixel[1]))
+            cls_name = "tube" if d.cls == self.tube_cls else "empty"
+            if not (0 <= u < W and 0 <= v < H):
+                print(f"   det#{i} {cls_name} pixel=({u},{v}) ✗ 像素超出深度图范围")
+                continue
+            z = geometry.sample_depth(depth, u, v, patch=patch, scale=scale,
+                                      z_min=zmin, z_max=zmax)
+            raw = float(depth[v, u]) * scale
+            tag = f"✓ {z:.3f}m" if z is not None else (
+                "✗空洞(中心=0)" if raw == 0 else f"✗超范围(中心{raw:.3f}m)")
+            print(f"   det#{i} {cls_name} pixel=({u},{v}) 中心原始={raw:.3f}m -> {tag}")
 
     # ---------- look-and-move 精对准器（按目标类别构造） ----------
     def _aligner(self, target_cls: int) -> LookAndMoveAligner:
