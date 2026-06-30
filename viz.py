@@ -33,6 +33,26 @@ def draw_rack(color_bgr: np.ndarray, rack: RackMap) -> np.ndarray:
     return out
 
 
+def draw_detections(color_bgr: np.ndarray, detections, tube_cls: int,
+                    names: dict | None = None) -> np.ndarray:
+    """画原始 YOLO 检测框（不结算坐标，不需要机械臂）：框+类别名+置信度。
+    tube=绿、empty(或其它)=红。names 是 {cls_id: name}，没有就直接显示 id。"""
+    out = color_bgr.copy()
+    n_tube = 0
+    for d in detections:
+        is_tube = (d.cls == tube_cls)
+        n_tube += int(is_tube)
+        color = (0, 255, 0) if is_tube else (0, 0, 255)
+        x1, y1, x2, y2 = (int(round(c)) for c in d.bbox)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        name = names.get(d.cls, str(d.cls)) if names else str(d.cls)
+        cv2.putText(out, f"{name} {d.conf:.2f}", (x1, max(y1 - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    cv2.putText(out, f"det={len(detections)}  tube={n_tube}  empty={len(detections)-n_tube}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+    return out
+
+
 def save_image(img: np.ndarray, out_dir: str | Path = "outputs", name: str = "rack.jpg") -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
